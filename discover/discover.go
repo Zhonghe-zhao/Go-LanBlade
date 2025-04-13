@@ -1,6 +1,7 @@
 package discover
 
 import (
+	"io"
 	"log"
 	"net"
 	"os"
@@ -36,6 +37,8 @@ func DiscoverDevices(timeoutSec int) {
 	entriesCh := make(chan *mdns.ServiceEntry, 32)
 	devicesMap := make(map[string]*mdns.ServiceEntry)
 
+	quietLogger := log.New(io.Discard, "", 0)
+
 	go func() {
 		timeout := time.After(time.Duration(timeoutSec) * time.Second)
 		for {
@@ -44,6 +47,13 @@ func DiscoverDevices(timeoutSec int) {
 				if entry == nil || entry.AddrV4 == nil {
 					continue
 				}
+
+				// !!! 添加环回地址过滤 !!!
+				if entry.AddrV4.IsLoopback() {
+					// log.Printf("[Debug] Ignoring loopback address for %s: %s", entry.Name, entry.AddrV4) // 可以取消注释用于调试
+					continue // 跳过环回地址记录
+				}
+
 				key := entry.AddrV4.String() + ":" + strconv.Itoa(entry.Port) + "|" + entry.Name
 				if _, exists := devicesMap[key]; !exists {
 					devicesMap[key] = entry
@@ -89,7 +99,7 @@ func DiscoverDevices(timeoutSec int) {
 					WantUnicastResponse: true,
 					DisableIPv4:         false,
 					DisableIPv6:         true,
-					Logger:              customLogger,
+					Logger:              quietLogger,
 				}
 				if err := mdns.Query(param); err != nil {
 					customLogger.Printf("接口 %s 查询 %s 失败: %v", iface.Name, svc, err)
@@ -103,9 +113,11 @@ func AnnounceSelf() {
 	host, _ := os.Hostname()
 	info := []string{"MyLANBox"}
 
+	ip := getLocalIP()
+
 	service, err := mdns.NewMDNSService(
 		host, "_workstation._tcp", "local.", "",
-		8000, nil, info,
+		8000, []net.IP{ip}, info,
 	)
 	if err != nil {
 		log.Fatalf("注册服务失败: %v", err)
@@ -123,4 +135,32 @@ func AnnounceSelf() {
 		select {}
 	}()
 	_ = server
+}
+
+func getLocalIP() net.IP {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Fatalf("获取网卡失败: %v", err)
+	}
+	for _, iface := range ifaces {
+		// 排除掉回环、未启用的接口
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.To4() != nil {
+				// 判断是私有网段
+				ip := ipNet.IP
+				if ip.IsPrivate() {
+					return ip
+				}
+			}
+		}
+	}
+	log.Fatal("未找到本地局域网 IP")
+	return nil
 }
